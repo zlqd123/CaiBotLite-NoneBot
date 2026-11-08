@@ -1,6 +1,12 @@
-"""插件主体: 指令解析、权限控制与消息发送。
+"""插件主体: 指令解析、权限控制与消息发送(QQ 官方 Bot 版)。
 
 白名单管理 / 设备登录 / 商店 / 踢出 已按需下线, 服务端不再处理对应数据包。
+
+与 OneBot v11 版的差异:
+- 标识符全部为字符串 openid(群=group_openid, 人=user_openid / member_openid)
+- 发送统一走 adapter-qq: 被动回复 bot.send(event), 服务器推送 send_to_group / send_to_c2c
+- 群聊只收 @ 消息, 指令需写成 ``@佩佩 /泰拉 进度``(根指令名必须显式出现)
+- 服务器主动推送的默认群用 group_openid 配置(CAIBOTLITE__DEFAULT_GROUP)
 """
 
 from __future__ import annotations
@@ -10,7 +16,8 @@ import asyncio
 from typing import Any
 
 from nonebot import get_bots, get_driver
-from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegment
+from nonebot.adapters import Bot, Event
+from nonebot.adapters.qq import Message, MessageSegment
 from nonebot.log import logger
 from nonebot.matcher import Matcher
 from nonebot.plugin import on_message
@@ -29,34 +36,39 @@ matcher = on_message(priority=50, block=False)
 NO_PERMISSION = "无权限"
 
 
-def _is_bot_admin(user_id: int) -> bool:
+def _is_bot_admin(user_id: str) -> bool:
     """机器人管理员: .env 里的 CAIBOTLITE__ADMINS / CAIBOTLITE__SUPERUSERS。
 
-    刻意**不看**群管理身份——受限指令只对服主开放, 群的 owner/admin 也拦在外面。
+    存 openid(可通过 iinfo 获取)。刻意**不看**群管理身份——受限指令只对服主开放,
+    群的 owner/admin 也拦在外面。
     """
     return user_id in config.superusers or user_id in config.admins
 
 
-def _user_id(event: MessageEvent) -> int:
-    """``event.get_user_id()`` 返回的是字符串, 而配置里存的是 int, 这里统一转换。"""
-    try:
-        return int(event.get_user_id())
-    except (TypeError, ValueError):
-        return 0
+def _user_id(event: Event) -> str:
+    """用户标识: 官方 Bot 为 member_openid / user_openid, OneBot 为 QQ 号, 统一字符串。"""
+    return str(event.get_user_id() or "")
 
 
-def _group_id(event: MessageEvent) -> int:
-    """OneBot v11 适配器没有 get_group_id, 私聊事件上也没有 group_id 字段。"""
-    return getattr(event, "group_id", 0) or 0
+def _group_id(event: Event) -> str:
+    """群标识: 官方 Bot 为 group_openid, OneBot 为群号, 私聊事件上不存在该字段。"""
+    return str(getattr(event, "group_openid", "") or getattr(event, "group_id", "") or "")
 
 
-def _role(event: MessageEvent) -> str:
-    """群成员身份: member / admin / owner, 私聊统一按 member 处理。"""
-    sender = getattr(event, "sender", None)
-    return getattr(sender, "role", None) or "member"
+def _role(event: Event) -> str:
+    """群成员身份: member / admin / owner, 私聊统一按 member 处理。
+
+    官方 Bot 的事件自带 ``author.member_role``; OneBot 从 sender.role 取。
+    """
+    author = getattr(event, "author", None)
+    role = getattr(author, "member_role", None) if author is not None else None
+    if not role:
+        sender = getattr(event, "sender", None)
+        role = getattr(sender, "role", None)
+    return role or "member"
 
 
-def _group_allowed(group_id: int, user_id: int) -> bool:
+def _group_allowed(group_id: str, user_id: str) -> bool:
     if not config.groups or _is_bot_admin(user_id):
         return True
     return group_id in config.groups
@@ -81,6 +93,8 @@ class CaiBotLite:
         #: 服务端(CaiBotLite.json)真正的远程执行白名单, 由 /泰拉 插件列表 的响应带回来。
         #: 权威只有服务端那一份, 这里只做缓存和展示, 不自己维护第二份。
         self.allowed_commands: list[str] = []
+        #: 已记录过 openid 的群, 避免重复打日志
+        self._seen_groups: set[str] = set()
 
     # ------------------------------------------------------------------ 启动
 
@@ -116,7 +130,7 @@ class CaiBotLite:
 
     # ------------------------------------------------------------------ 发消息
 
-    def pick_bot(self, self_id: int = 0) -> Bot | None:
+    def pick_bot(self, self_id: str = "") -> Any | None:
         bots = get_bots()
         if not bots:
             return None
@@ -126,59 +140,89 @@ class CaiBotLite:
                 return bot
         return next(iter(bots.values()))
 
-    async def send(self, target: ReplyTarget | None, result: RenderResult) -> None:
-        bot = self.pick_bot(target.self_id if target else 0)
-        if bot is None:
-            logger.warning("没有可用的 OneBot 连接, 消息已丢弃")
-            return
+    @staticmethod
+    def _build_message(result: RenderResult) -> Message | None:
+        """把渲染结果转成官方适配器消息。
+
+        - image 为 ``base64://`` 时(背包渲染)转 bytes 走 file_image(自动上传媒体)
+        - image 为 http(s) 链接时(地图图片)直接用 image 段
+        - file 为 http(s) 链接时(地图/存档)用 file 段
+        - 其余文本原样附带
+        """
+        import base64 as _base64
+        from pathlib import Path as _Path
 
         message = Message()
         if result.image:
-            message += MessageSegment.image(result.image)
+            image = result.image
+            if image.startswith("base64://"):
+                data = _base64.b64decode(image[len("base64://") :])
+                message += MessageSegment.file_image(data, file_name="render.jpg")
+            elif image.startswith(("http://", "https://")):
+                message += MessageSegment.image(image)
+            else:
+                # 本地路径(理论上不出现, 兜底支持)
+                message += MessageSegment.file_image(_Path(image))
         if result.file:
-            message += MessageSegment("file", {"file": result.file, "name": result.file_name})
+            file_ref = result.file
+            if file_ref.startswith(("http://", "https://")):
+                message += MessageSegment.file(file_ref)
+            elif file_ref.startswith("base64://"):
+                data = _base64.b64decode(file_ref[len("base64://") :])
+                message += MessageSegment.file_file(data, file_name=result.file_name or "file")
+            # 其它形态的文件引用(本地路径等)官方通道不可达, 忽略
         if result.text:
             message += MessageSegment.text(result.text)
-        if not message:
+        return message if message else None
+
+    async def send(self, target: ReplyTarget | None, result: RenderResult) -> None:
+        bot = self.pick_bot(target.self_id if target else "")
+        if bot is None:
+            logger.warning("没有可用的机器人连接, 消息已丢弃")
+            return
+
+        message = self._build_message(result)
+        if message is None:
             logger.warning("渲染结果为空, 没有可发送的内容")
             return
 
-        group_id = target.group_id if target else 0
-        user_id = target.user_id if target else 0
+        # 被动回复: 带原始事件时走 bot.send, 引用/序号/媒体上传由适配器代劳
+        if target is not None and target.event is not None:
+            try:
+                await bot.send(target.event, message)
+                return
+            except Exception as exc:
+                logger.warning(f"被动回复发送失败: {exc}")
+                return
+
+        # 主动推送(服务器广播等): 官方通道只有 openid 可用
+        group_id = target.group_id if target else ""
+        user_id = target.user_id if target else ""
         if not group_id and not user_id:
-            # 只有"服务器主动发来、又没有指定回送目标"的数据包才会走默认群,
-            # 私聊的回复带着 user_id, 绝不会掉到这里再发到群里去
             group_id = self.cfg.default_group
         if not group_id and not user_id:
-            logger.warning("没有配置默认回复群, 消息已丢弃")
+            logger.warning("没有配置默认回复群(CAIBOTLITE__DEFAULT_GROUP), 消息已丢弃")
             return
-
-        reply = (
-            MessageSegment("reply", {"id": target.message_id})
-            if target and target.message_id
-            else None
-        )
-
         try:
-            await self._raw_send(bot, group_id, user_id, (reply + message) if reply else message)
+            if group_id:
+                await bot.send_to_group(group_openid=group_id, message=message)
+            else:
+                await bot.send_to_c2c(openid=user_id, message=message)
         except Exception as exc:
-            if reply is None:
-                logger.warning(f"发送消息失败: {exc}")
-                return
-            # 有的实现不支持 reply 消息段, 退化成普通消息再试一次
-            try:
-                await self._raw_send(bot, group_id, user_id, message)
-            except Exception as retry_exc:
-                logger.warning(f"发送消息失败: {retry_exc}")
+            # 带文件/图片的主动推送失败时, 退化为纯文本重试一次
+            if result.text:
+                try:
+                    text_only = Message(MessageSegment.text(result.text))
+                    if group_id:
+                        await bot.send_to_group(group_openid=group_id, message=text_only)
+                    else:
+                        await bot.send_to_c2c(openid=user_id, message=text_only)
+                    return
+                except Exception as retry_exc:
+                    logger.warning(f"主动推送文本重试仍失败: {retry_exc}")
+            logger.warning(f"发送消息失败: {exc}")
 
-    @staticmethod
-    async def _raw_send(bot: Bot, group_id: int, user_id: int, message: Message) -> None:
-        if group_id:
-            await bot.send_group_msg(group_id=group_id, message=message)
-        else:
-            await bot.send_private_msg(user_id=user_id, message=message)
-
-    async def reply_text(self, event: MessageEvent, text: str) -> None:
+    async def reply_text(self, event: Event, text: str) -> None:
         await self.send(ReplyTarget.from_event(event), RenderResult(text=text))
 
     # ------------------------------------------------------------------ 收发包
@@ -344,12 +388,12 @@ class CaiBotLite:
 
     # ------------------------------------------------------------------ 权限
 
-    async def check_permission(self, event: MessageEvent, spec: CommandSpec, args: list[str]) -> bool:
+    async def check_permission(self, event: Event, spec: CommandSpec, args: list[str]) -> bool:
         """按 commands.json 里的权限放行。
 
         ``user``    对所有人开放
         ``botadmin`` 只认 ``CAIBOTLITE__ADMINS`` / ``CAIBOTLITE__SUPERUSERS``
-                    里的 QQ, 群管理不算
+                    里的 openid, 群管理不算
 
         另外, 公开指令可以带 ``开放指令`` 列表(比如 ``/泰拉 执行`` 只默认放行
         time / clear / wind / worldevent): 名单外的指令按 ``botadmin`` 处理,
@@ -373,7 +417,7 @@ class CaiBotLite:
 
 
 #: 帮助的固定头部。用法/说明/权限都来自 commands.json, 这里只放不变的引导语
-HELP_HEADER = "所有指令都要以 /泰拉 开头, 后面跟指令名和参数。"
+HELP_HEADER = "所有指令都要以 /泰拉 开头, 后面跟指令名和参数。群里请先 @ 机器人。"
 
 
 def build_help(server_name: str, table: CommandTable, allowed: list[str] | None = None) -> str:
@@ -471,9 +515,9 @@ def get_runtime() -> CaiBotLite:
 
 
 @matcher.handle()
-async def handle_message(matcher_obj: Matcher, event: MessageEvent) -> None:
+async def handle_message(matcher_obj: Matcher, bot: Bot, event: Event) -> None:
     try:
-        await _handle_message(event)
+        await _handle_message(event, bot)
     except Exception as exc:
         # 任何异常都要让提问的人看见, 而不是自己在日志里闷掉
         logger.opt(exception=exc).error(f"处理消息时出错: {exc}")
@@ -483,14 +527,21 @@ async def handle_message(matcher_obj: Matcher, event: MessageEvent) -> None:
             logger.opt(exception=exc).error("出错后连提示都发不出去")
 
 
-async def _handle_message(event: MessageEvent) -> None:
+async def _handle_message(event: Event, bot: Bot) -> None:
     rt = get_runtime()
     text = event.get_plaintext()
     if not rt.cfg.enabled:
         logger.debug("插件未启用, 已忽略消息")
         return
-    if _user_id(event) == event.self_id:
+    if _user_id(event) == str(getattr(event, "self_id", "")):
         return
+
+    group_id = _group_id(event)
+    if group_id and group_id not in rt._seen_groups:
+        # 首次见到某个群时把 openid 打出来, 方便把它填进
+        # CAIBOTLITE__DEFAULT_GROUP / CAIBOTLITE__GROUPS
+        rt._seen_groups.add(group_id)
+        logger.info(f"发现群 openid: {group_id} (可填入 CAIBOTLITE__DEFAULT_GROUP / GROUPS)")
 
     # 不打印每条消息: 群里说什么都会进来, 打日志既刷屏又没有信息量。
     # 只在确实是一条指令时才记录, 便于排查"发了没反应"。
@@ -500,7 +551,7 @@ async def _handle_message(event: MessageEvent) -> None:
     name, args, explicit = parsed
 
     if config.debug:
-        logger.info(f"指令: {name} 参数={args} 显式={explicit} 来自群 {_group_id(event)}")
+        logger.info(f"指令: {name} 参数={args} 显式={explicit} 来自群 {group_id}")
 
     table = rt.commands
     if table.is_empty:
@@ -540,6 +591,11 @@ async def _handle_message(event: MessageEvent) -> None:
         args = args[:-1]
 
     target = ReplyTarget.from_event(event)
+    if not target.self_id and bot.self_id:
+        # QQ 官方适配器的事件上没有 self_id 字段, 而 TShock 端按 Int64 反序列化
+        # __bridge.self_id, 空字符串会直接报 "Error converting value "" to Int64"。
+        # 这里用注入的 bot 补上机器人 QQ 号(纯数字, 与 Int64 兼容)。
+        target.self_id = str(bot.self_id)
     if spec.package in FILE_PACKAGES:
         # 服务器的文件地址打不开时, 让它改成 base64 内联发
         target = await rt.file_target(target)

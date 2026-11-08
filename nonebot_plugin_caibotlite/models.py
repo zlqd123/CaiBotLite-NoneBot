@@ -52,7 +52,13 @@ def to_snake_case(name: str) -> str:
 
 
 class ReplyTarget:
-    """一条消息应该回复到哪里。"""
+    """一条消息应该回复到哪里。
+
+    QQ 官方 Bot 只认 openid(字符串), 因此这里的 group_id / user_id / message_id
+    全部是字符串: 群=group_openid, 人=user_openid / member_openid。
+    ``event`` 保留原始事件引用, 供发送层走 ``bot.send()`` 被动回复
+    (不参与 to_dict 序列化, 不会写进桥接数据包)。
+    """
 
     __slots__ = (
         "self_id",
@@ -64,18 +70,20 @@ class ReplyTarget:
         "nickname",
         "is_admin",
         "file_mode",
+        "event",
     )
     def __init__(
         self,
-        self_id: int = 0,
-        group_id: int = 0,
-        user_id: int = 0,
-        message_id: int = 0,
+        self_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        message_id: str = "",
         session: str = "",
         at_sender: bool = False,
         nickname: str = "",
         is_admin: bool = False,
         file_mode: str = "",
+        event: Any = None,
     ) -> None:
         self.self_id = self_id
         self.group_id = group_id
@@ -87,27 +95,33 @@ class ReplyTarget:
         self.is_admin = is_admin
         # 附件外发偏好: link=用下载链接(默认), inline=让服务器直接 base64 内联
         self.file_mode = file_mode
+        # 原始事件引用(不序列化)
+        self.event = event
 
     @classmethod
     def from_event(cls, event: Any) -> ReplyTarget:
-        """从 OneBot v11 的消息事件构造回复目标。
+        """从消息事件构造回复目标。
 
-        注意 OneBot v11 适配器并没有 ``get_group_id()`` / ``get_role()``,
-        群号与身份都要自己从事件上取, 私聊事件上并不存在这些字段。
+        兼容 QQ 官方适配器(群=group_openid, 人=user/member_openid, 消息 id=event.id)
+        与 OneBot v11(群号/用户号/message_id)两种事件, 字段统一为字符串。
         """
-        group_id = getattr(event, "group_id", 0) or 0
-        sender = getattr(event, "sender", None)
+        author = getattr(event, "author", None)
         nickname = ""
-        if sender is not None:
-            nickname = getattr(sender, "card", "") or getattr(sender, "nickname", "") or ""
+        if author is not None:
+            nickname = getattr(author, "username", "") or ""
+        if not nickname:
+            sender = getattr(event, "sender", None)
+            if sender is not None:
+                nickname = getattr(sender, "card", "") or getattr(sender, "nickname", "") or ""
 
         return cls(
-            self_id=getattr(event, "self_id", 0),
-            group_id=group_id,
-            user_id=getattr(event, "user_id", 0),
-            message_id=getattr(event, "message_id", 0),
+            self_id=str(getattr(event, "self_id", "") or ""),
+            group_id=str(getattr(event, "group_openid", "") or getattr(event, "group_id", "") or ""),
+            user_id=str(event.get_user_id() or ""),
+            message_id=str(getattr(event, "id", "") or getattr(event, "message_id", "") or ""),
             at_sender=False,
             nickname=nickname,
+            event=event,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -197,14 +211,14 @@ def get_target(package: dict[str, Any]) -> ReplyTarget | None:
         return None
 
     return ReplyTarget(
-        self_id=raw.get("self_id", 0),
-        group_id=raw.get("group_id", 0),
-        user_id=raw.get("user_id", 0),
-        message_id=raw.get("message_id", 0),
-        session=raw.get("session", ""),
-        at_sender=raw.get("at_sender", False),
-        nickname=raw.get("nickname", ""),
-        is_admin=raw.get("is_admin", False),
+        self_id=str(raw.get("self_id", "") or ""),
+        group_id=str(raw.get("group_id", "") or ""),
+        user_id=str(raw.get("user_id", "") or ""),
+        message_id=str(raw.get("message_id", "") or ""),
+        session=str(raw.get("session", "") or ""),
+        at_sender=bool(raw.get("at_sender", False)),
+        nickname=str(raw.get("nickname", "") or ""),
+        is_admin=bool(raw.get("is_admin", False)),
     )
 
 

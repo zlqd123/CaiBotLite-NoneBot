@@ -142,17 +142,20 @@ class Config(BaseSettings):
     server_name: str = "Terraria 服务器"
     """展示用的服务器名, 收到 Hello 数据包后会被服务器名覆盖"""
 
-    default_group: int = 0
-    """服务器主动发来的数据包(白名单校验等)默认回送到哪个群"""
+    default_group: str = ""
+    """服务器主动发来的数据包(服务器广播等)默认回送到哪个群。
 
-    groups: list[int] = Field(default_factory=list)
-    """允许使用机器人的群号, 留空表示不限制"""
+    QQ 官方 Bot 只有 openid, 这里填 group_openid(可通过 iinfo 或启动日志获取)。
+    """
 
-    admins: list[int] = Field(default_factory=list)
-    """管理员 QQ 号, 可以执行远程指令 / 管理白名单"""
+    groups: list[str] = Field(default_factory=list)
+    """允许使用机器人的群 openid 列表, 留空表示不限制"""
 
-    superusers: list[int] = Field(default_factory=list)
-    """超级管理员 QQ 号, 无视群白名单限制"""
+    admins: list[str] = Field(default_factory=list)
+    """管理员 openid 列表, 可以执行远程指令 / 管理白名单"""
+
+    superusers: list[str] = Field(default_factory=list)
+    """超级管理员 openid 列表, 无视群白名单限制"""
 
     prefix: list[str] = Field(default_factory=lambda: ["", "/", "。"])
     """指令前缀, 空字符串表示裸指令也可用"""
