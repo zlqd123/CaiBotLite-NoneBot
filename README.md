@@ -1,14 +1,27 @@
-# CaiBotLite-NoneBot
+# CaiBotLite-NoneBot（QQ 官方 Bot 版）
 
-让任意基于 **OneBot v11** 的 QQ 机器人（Lagrange.Core / NapCat / LLOneBot / go-cqhttp）
+通过 **QQ 官方机器人**（NoneBot2 `adapter-qq`，群聊 `qq_group_openid` 通道）
 接入 **TShock CaiBotLite**：群里一条指令查世界进度、看在线玩家、翻背包（**仿游戏界面的
 背包全景图**）、拉排行榜，还能改时间、造天气、下载地图与存档。
 
 ```
-QQ 群  ──OneBot v11──▶  NoneBot 插件  ──WebSocket──▶  TShock 插件  ──▶  你的服务器
-         (Lagrange / NapCat / LLOneBot)              (CaiBotLite.dll)
-                        ↑ 本仓库                      ↑ 见下方"TShock 端"
+QQ 群(@机器人) ──官方 Bot WS──▶  NoneBot 插件  ──WebSocket──▶  TShock 插件  ──▶  你的服务器
+                (adapter-qq, openid)          (CaiBotLite.dll)
+                        ↑ 本仓库(qqbot 分支)     ↑ 见下方"TShock 端"
 ```
+
+> **分支说明**：本分支（`qqbot`）为 QQ 官方 Bot 适配版（v2.0.0，标识符全部为
+> 字符串 openid）；**OneBot v11 版（v1.1.0，Lagrange / NapCat / LLOneBot）在
+> [`NoneBot` 分支](https://github.com/zlqd123/CaiBotLite-NoneBot/tree/NoneBot)**，
+> 两版互相独立，按机器人通道二选一。
+
+- **不经过官方 CaiBot 机器人**，数据全在自己手上。
+- **玩家登录完全不经过机器人**，进服走 TShock 自己的 `/login` `/register` 和 SSC。
+- 桥接双向（`auto` 模式监听+主动连两条都试），**跨网络只要一端有公网地址就能配通**。
+- 群聊**只收 @ 消息**，指令需写成 `@机器人 /泰拉 进度`（根指令名必须显式出现）；
+  标识符全部为字符串 openid（群=`group_openid`，人=`user_openid` / `member_openid`）；
+  发送统一走 adapter-qq：被动回复 `bot.send(event)`，服务器推送走
+  `send_to_group` / `send_to_c2c`。
 
 - **不经过官方 CaiBot 机器人**，数据全在自己手上。
 - **玩家登录完全不经过机器人**，进服走 TShock 自己的 `/login` `/register` 和 SSC。
@@ -33,7 +46,8 @@ QQ 群  ──OneBot v11──▶  NoneBot 插件  ──WebSocket──▶  TSh
 
 ### 2. 机器人端
 
-装一个 OneBot v11 实现并接入 NoneBot2，然后：
+NoneBot2 接入 **QQ 官方机器人适配器 adapter-qq**（`nonebot-plugin-adapter-qq`，
+在 QQ 开放平台创建机器人、配置 WS 回调），然后：
 
 ```bash
 pip install pydantic-settings websockets httpx Pillow
@@ -57,13 +71,13 @@ pip install pydantic-settings websockets httpx Pillow
 最后在 `pyproject.toml`（或启动插件的配置）里声明
 `plugins = ["nonebot_plugin_caibotlite"]`（或放入 `plugin_dirs` 指定的目录）。
 
-`.env` 里至少填：
+`.env` 里至少填（**全部是 openid 字符串，不是 QQ 号**）：
 
 ```dotenv
 CAIBOTLITE__SECRET=和 TShock 端一致的通讯密钥
 CAIBOTLITE__MODE=auto
-CAIBOTLITE__ADMINS=[机器人管理员的QQ]
-CAIBOTLITE__DEFAULT_GROUP=服务器主动发消息时默认回送的群号
+CAIBOTLITE__ADMINS=["机器人管理员的 user_openid"]
+CAIBOTLITE__DEFAULT_GROUP=服务器主动发消息时默认回送的群 openid
 ```
 
 ---
@@ -80,9 +94,9 @@ CAIBOTLITE__DEFAULT_GROUP=服务器主动发消息时默认回送的群号
 | `SERVER_URL` | `ws://127.0.0.1:17779/onebot/v11/ws` | TShock 端地址（client/auto 模式用） |
 | `LISTEN_HOST` / `LISTEN_PORT` / `LISTEN_PATH` | `0.0.0.0` / `8080` / `/caibotlite` | server 模式监听参数 |
 | `SERVER_NAME` | `Terraria 服务器` | 展示用服务器名，握手后会被服务器名覆盖 |
-| `DEFAULT_GROUP` | `0` | 服务器主动发来的消息默认回送到哪个群 |
-| `GROUPS` | `[]` | 允许使用机器人的群号，空 = 不限制 |
-| `ADMINS` / `SUPERUSERS` | `[]` | 机器人管理员 / 超级管理员 QQ（群管理身份**不算**） |
+| `DEFAULT_GROUP` | `""` | 服务器主动发来的消息默认回送到哪个群（**群 openid**） |
+| `GROUPS` | `[]` | 允许使用机器人的群 openid 列表，空 = 不限制 |
+| `ADMINS` / `SUPERUSERS` | `[]` | 机器人管理员 / 超级管理员的 openid（群管理身份**不算**） |
 | `PREFIX` / `ROOTS` | `["", "/", "。"]` / `["泰拉", "tl"]` | 指令前缀与根指令名 |
 | `COMMANDS_PATH` | 空 | 指令表 `commands.json` 路径，空 = 用插件自带那份 |
 | `RANK_LIMIT` | `10` | 排行榜每页条数 |
@@ -102,7 +116,8 @@ CAIBOTLITE__DEFAULT_GROUP=服务器主动发消息时默认回送的群号
 
 ## 指令
 
-**所有指令都必须写成 `/泰拉 xxx`**（根指令名 `泰拉` 或简写 `tl`）。指令表在
+**所有指令都必须写成 `@机器人 /泰拉 xxx`**（官方 Bot 群聊只收 @ 消息，根指令名
+`泰拉` 或简写 `tl` 必须显式出现）。指令表在
 [`commands.json`](nonebot_plugin_caibotlite/commands.json) 里，**没写死在代码中**，
 改 JSON 即生效，`/泰拉 帮助` 的内容也完全由它生成。
 
@@ -179,7 +194,9 @@ TShock 自身权限检查对它无效，服务端 `CaiBotLite.json` 的 `允许�
   （官方 QQ 机器人参考实现）；
 - TShock 端协议与数据包设计来自
   [**UnrealMultiple/TShockPlugin**](https://github.com/UnrealMultiple/TShockPlugin)；
-- OneBot v11 协议来自 [OneBot 标准](https://github.com/botuniverse/onebot-11)。
+- QQ 官方机器人接入基于 [nonebot-adapter-qq](https://github.com/nonebot/adapter-qq)
+  （QQ 开放平台机器人协议）；OneBot v11 版实现见
+  [`NoneBot` 分支](https://github.com/zlqd123/CaiBotLite-NoneBot/tree/NoneBot)。
 
 本仓库以 **GPL-3.0** 发布（与 TShock 端 [CaiBotLitePlugin](https://github.com/zlqd123/CaiBotLitePlugin-nonebot) 一致），
 `caibotlite/` 目录为上游参考实现副本，权利归其原作者所有。
